@@ -1,0 +1,134 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-13 是 Intel 标准档，公开仓库免费可用。
+    # macos-14/15 会解析成 arm64-us-xl 私有规格，公开仓库拿不到会 2 秒 Cancelled。
+    runs-on: macos-13
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build dylib
+        run: |
+          chmod +x build.sh
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)" ./build.sh
+
+      - name: Verify artifact
+        run: |
+          set -e
+          F="build/libadlab.dylib"
+          test -f "$F" || { echo "失败: 未找到工件"; exit 1; }
+
+          echo "=== 基本信息 ==="
+          ls -l "$F"
+          file "$F"
+          shasum -a 256 "$F"
+
+          echo
+          echo "=== 架构必须是 thin arm64 ==="
+          ARCHS="$(lipo -archs "$F")"
+          echo "archs: $ARCHS"
+          test "$ARCHS" = "arm64" || { echo "失败: 架构应为 arm64，实际 $ARCHS"; exit 1; }
+
+          echo
+          echo "=== 绝对禁止 __interpose ==="
+          echo "v1 用 __interpose 拦 _dyld_get_image_name，dyld 绑定期就拿到 NULL，"
+          echo "导致注入后必然闪退。v2 起彻底删除，这里出现即为编到旧源码。"
+          if otool -l "$F" | grep -q '__interpose'; then
+            echo "失败: 发现 __interpose 段"
+            otool -l "$F" | grep -n -A3 '__interpose'
+            exit 1
+          fi
+          echo "OK: 无 __interpose"
+
+          echo
+          echo "=== 禁止全局 C 函数 hook（dlopen/dlsym 会走 interpose 重定向自递归）==="
+          if nm -u "$F" 2>/dev/null | grep -qE ' _dlsym$'; then
+            echo "警告: 引入了 dlsym（当前源码不使用，出现说明编到旧版本）"
+          else
+            echo "OK: 无 dlsym"
+          fi
+
+          echo
+          echo "=== LC_ID_DYLIB 必须指向 Frameworks/ ==="
+          IDLINE="$(otool -l "$F" | grep -A2 LC_ID_DYLIB | grep 'name ' | head -1 || true)"
+          echo "$IDLINE"
+          echo "$IDLINE" | grep -q '@executable_path/Frameworks/' || {
+            echo "失败: LC_ID_DYLIB 不是 @executable_path/Frameworks/ 形式"
+            echo "      （TrollFools 会把它当 @rpath 处理，install_name_tool -change 变空操作）"
+            exit 1
+          }
+          echo "OK: LC_ID_DYLIB 正确"
+
+          echo
+          echo "=== 必备 selector 必须在 strings 里（硬性）==="
+          for sel in \
+              "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:" \
+              "displayLinkWithTarget:selector:" \
+              "setRate:" \
+              "sendEvent:" \
+              "timeIntervalSinceReferenceDate" \
+              "openURL:options:completionHandler:" \
+              "open:options:completionHandler:" \
+              "presentViewController:animated:completion:" \
+              "viewDidAppear:"
+          do
+            if strings -a "$F" | grep -q -- "$sel"; then
+              echo "  OK   $sel"
+            else
+              echo "  FAIL $sel 缺失"
+              exit 1
+            fi
+          done
+
+          echo
+          echo "=== 关键实现符号（static 可能被 -O2 内联，只告警不阻断）==="
+          for sym in \
+              kswizzle hook_DoubleZeroArg name_is_numerator name_is_denominator \
+              install_time_hooks install_timer_hooks install_player_hooks \
+              install_discovered_hooks install_shake_block install_stealth \
+              cfg_domain cfg_load cfg_save AdlabWindow AdlabBall AdlabPanel
+          do
+            if nm -a "$F" 2>/dev/null | grep -q "_$sym"; then
+              echo "  OK   $sym"
+            else
+              echo "::warning::未找到符号 $sym（可能已内联）"
+            fi
+          done
+
+          echo
+          echo "=== 禁止残留的 v1 符号 ==="
+          for bad in adlab_fopen _interpose_fopen resolve_fopen_original gOrigDyldImageName; do
+            if nm -a "$F" 2>/dev/null | grep -q "_$bad"; then
+              echo "失败: 残留 v1 符号 $bad"
+              exit 1
+            fi
+          done
+          echo "OK: 无 v1 残留符号"
+
+          echo
+          echo "=== 部署目标 ==="
+          vtool -show-build "$F" || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libadlab
+          path: build/libadlab.dylib
+          if-no-files-found: warn
+          retention-days: 30
